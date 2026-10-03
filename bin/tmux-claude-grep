@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Grep the scrollback of every pane (emacs multi-occur). Type to narrow live; Enter jumps to
+# that window and searches to the line. Dumps the last $TMUX_CLAUDE_GREP_LINES lines of each pane.
+LINES=${TMUX_CLAUDE_GREP_LINES:-5000}
+CTX=15
+TAB=$(printf '\t')
+
+if [ "$1" = --preview ]; then            # $2=file $3=line $4=query
+  n=$3; s=$((n>CTX ? n-CTX : 1))
+  sed -n "${s},$((n+CTX))p" "$2" | rg -S --color=always --passthru -- "$4"
+  exit 0
+fi
+
+case $TMUX_CLAUDE_CLIENT in ''|*'#{'*) C=();; *) C=(-c "$TMUX_CLAUDE_CLIENT");; esac
+self=$(readlink -f "$0")
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+for p in $(tmux list-panes -a -F '#{session_name}:#{window_index}'); do
+  tmux capture-pane -p -J -t "$p" -S "-$LINES" > "$tmp/$p"
+done
+cd "$tmp" || exit 1
+sel=$(: | fzf --disabled --ansi --layout=reverse --prompt='grep> ' --delimiter="$TAB" --print-query \
+  --bind "change:reload:[ -n {q} ] && rg -S -n --no-heading --color=always --field-match-separator '$TAB' --max-columns=300 --max-columns-preview -- {q} * 2>/dev/null || true" \
+  --preview "$self --preview {1} {2} {q}" \
+  --preview-window=down:45%:wrap) || exit 0
+q=$(sed -n 1p <<<"$sel"); line=$(sed -n 2p <<<"$sel")
+[ -n "$line" ] || exit 0
+win=${line%%$TAB*}
+tmux switch-client "${C[@]}" -t "$win"
+tmux copy-mode -t "$win"
+tmux send-keys -t "$win" -X search-backward-text "$q"

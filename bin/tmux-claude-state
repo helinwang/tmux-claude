@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Classify every window by what its Claude Code pane is doing.
+#   ask   = waiting on you: permission prompt, question menu, plan approval
+#   busy  = running (footer shows "esc to interrupt" / "ctrl+c to interrupt")
+#   draft = idle, prompt has unsent text
+#   idle  = at prompt
+#   other = not a Claude pane
+# usage: tmux-claude-state [--set] [--counts]
+#   prints "session:idx<TAB>state" per window (unless --counts)
+#   --set     also stores state in window option @state (for status bar)
+#   --counts  print one status-bar line with counts instead of the list
+set_opt=0; counts=0
+for a in "$@"; do case $a in --set) set_opt=1;; --counts) counts=1;; esac; done
+nb=0; nd=0; ni=0; na=0; setcmd=()
+while IFS=$'\t' read -r win wid; do
+  tail=$(tmux capture-pane -p -t "$win" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -12)
+  if   grep -Eq 'Esc to cancel|Enter to (select|confirm|submit)|\[[yY]/[nN]\]|Do you want to' <<<"$tail"; then st=ask; na=$((na+1))
+  elif grep -Eq '(esc|ctrl\+c) to interrupt' <<<"$tail"; then st=busy;  nb=$((nb+1))
+  elif grep -E '^❯' <<<"$tail" | tail -1 | grep -Eq '^❯ [^[:space:]]'; then st=draft; nd=$((nd+1))   # input box = last ❯ line
+  elif grep -Eq '^❯|shift\+tab'    <<<"$tail"; then st=idle;  ni=$((ni+1))
+  else st=other; fi
+  [ $counts = 1 ] || printf '%s\t%s\n' "$win" "$st"
+  setcmd+=(set -w -t "$wid" @state "$st" \;)
+done < <(tmux list-windows -a -F '#{session_name}:#{window_index}	#{window_id}')
+[ $set_opt = 1 ] && [ ${#setcmd[@]} -gt 0 ] && tmux "${setcmd[@]::${#setcmd[@]}-1}"
+[ $counts = 1 ] && printf '#[fg=white,bg=red] ◐%d #[default] #[fg=black,bg=yellow] ●%d #[default] #[fg=white,bg=magenta] ✎%d #[default] ○%d' "$na" "$nb" "$nd" "$ni"
+exit 0

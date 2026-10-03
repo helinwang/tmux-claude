@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# ivy-style window switcher. Type to narrow, Enter to jump.
+# Rows: session:idx  state-icon  name  age.  Order: last visited first (@visited). Current window is dimmed
+# and the cursor starts on it, so Enter with no typing just closes the picker.
+# Keys: alt-n needs-you, alt-b busy, alt-i idle, alt-d draft, alt-a all, ctrl-x kill, ctrl-n new window (same dir, runs claude).
+# usage: tmux-claude-win            popup picker
+#        tmux-claude-win --last     jump to previously visited window (global, across sessions)
+#        tmux-claude-win --preview W   (internal) preview helper for fzf
+#        tmux-claude-win --new W       (internal) new window in W's directory, start claude, switch to it
+# env TMUX_CLAUDE_CLIENT=<client tty> pins the client (set by the tmux binding).
+self=$(readlink -f "$0"); here=$(dirname "$self")
+case $TMUX_CLAUDE_CLIENT in ''|*'#{'*) C=();; *) C=(-c "$TMUX_CLAUDE_CLIENT");; esac
+cur=$(tmux display -p "${C[@]}" '#{session_name}:#{window_index}')
+
+if [ "$1" = --preview ]; then        # $2 = window; screen without trailing blank lines
+  tmux capture-pane -p -e -t "$2" | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' | tail -60
+  exit 0
+fi
+
+if [ "$1" = --new ]; then            # $2 = window to copy the directory from
+  dir=$(tmux display -p -t "$2" '#{pane_current_path}')
+  id=$(tmux new-window -P -F '#{window_id}' -t "${cur%%:*}:" -c "$dir")
+  tmux send-keys -t "$id" claude Enter
+  exec tmux switch-client "${C[@]}" -t "$id"
+fi
+
+if [ "$1" = --last ]; then
+  last=$(tmux list-windows -a -F '#{?@visited,#{@visited},0}	#{window_activity}	#{session_name}:#{window_index}' \
+    | sort -t"$(printf '\t')" -k1,1nr -k2,2nr | cut -f3 | grep -vx "$cur" | head -1)
+  [ -n "$last" ] && exec tmux switch-client "${C[@]}" -t "$last"
+  exit 0
+fi
+
+export STATEF=$(mktemp); trap 'rm -f "$STATEF"' EXIT
+"$here/tmux-claude-state" --set > "$STATEF"
+export CUR=$cur SESSIONS=$(tmux list-sessions -F '#S' | tr '\n' ' ') COLS=$(tput cols)   # list() runs in fzf reload subshells
+
+list() {   # $1 = filter: all|ask|busy|idle|draft
+  tmux list-windows -a -F '#{?@visited,#{@visited},0}	#{window_activity}	#{session_name}:#{window_index}	#{window_name}' \
+  | sort -t"$(printf '\t')" -k1,1nr -k2,2nr | cut -f2- \
+  | awk -F'\t' -v OFS='\t' -v cur="$CUR" -v filt="${1:-all}" -v now="$(date +%s)" -v sess="$SESSIONS" -v statef="$STATEF" -v cols="${COLS:-120}" '
+    BEGIN {
+      while ((getline l < statef) > 0) { split(l, a, "\t"); st[a[1]] = a[2] }
+      n = split(sess, sl, " "); for (i = 1; i <= n; i++) col[sl[i]] = 31 + (i % 6)
+      icon["ask"] = "\033[1;31m◐\033[0m"; icon["busy"] = "\033[33m●\033[0m"; icon["draft"] = "\033[35m✎\033[0m"; icon["idle"] = "○"; icon["other"] = " "
+      nw = cols - 26; if (nw < 20) nw = 20        # name fills the width: 2 pointer + 14 target + icon + age + spaces
+    }
+    function age(t,  d) { d = now - t; if (d < 60) return d "s"; if (d < 3600) return int(d/60) "m"; if (d < 86400) return int(d/3600) "h"; return int(d/86400) "d" }
+    {
+      win = $2; name = $3; s = st[win]; if (s == "") s = "other"
+      if (filt != "all" && s != filt) next
+      split(win, p, ":")
+      row = sprintf("\033[%dm%-14s\033[0m %s %-" nw "." nw "s %5s", col[p[1]], win, icon[s], name, age($1))
+      if (win == cur) row = "\033[2m" row "\033[0m"   # current window: dimmed, natural position
+      print win, row
+    }'
+}
+export -f list
+rows=$(list all)
+n=$(awk -F'\t' -v c="$cur" '$1==c {print NR; exit}' <<<"$rows")
+start=(); [ "${n:-1}" -gt 1 ] && start=(--sync --bind "start:pos($n)")   # cursor on the current window
+sel=$(fzf <<<"$rows" --ansi "${start[@]}" --delimiter='\t' --with-nth=2 --layout=reverse --no-sort --tiebreak=index \
+        --prompt='window> ' --header='alt-n needs you  alt-b busy  alt-i idle  alt-d draft  alt-a all  ctrl-x kill  ctrl-n new' \
+        --preview "$self --preview {1}" --preview-window=down:33%:nowrap \
+        --bind "alt-n:change-prompt(needs you> )+reload(bash -c 'list ask')" \
+        --bind "alt-b:change-prompt(busy> )+reload(bash -c 'list busy')" \
+        --bind "alt-i:change-prompt(idle> )+reload(bash -c 'list idle')" \
+        --bind "alt-d:change-prompt(draft> )+reload(bash -c 'list draft')" \
+        --bind "alt-a:change-prompt(window> )+reload(bash -c 'list all')" \
+        --bind "ctrl-x:execute-silent(tmux kill-window -t {1})+reload(bash -c 'list all')" \
+        --bind "ctrl-n:execute-silent($self --new {1})+abort") || exit 0
+tmux switch-client "${C[@]}" -t "${sel%%	*}"
