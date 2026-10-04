@@ -9,19 +9,41 @@
 #   prints "session:idx<TAB>state" per window (unless --counts)
 #   --set     also stores state in window option @state (for status bar)
 #   --counts  print one status-bar line with counts instead of the list
+# One tmux call captures every pane (a \001 marker line precedes each), one awk pass classifies:
+# ~10 ms for 80 windows instead of ~6 forks per window.
 set_opt=0; counts=0
 for a in "$@"; do case $a in --set) set_opt=1;; --counts) counts=1;; esac; done
-nb=0; nd=0; ni=0; na=0; setcmd=()
+cap=()
 while IFS=$'\t' read -r win wid; do
-  tail=$(tmux capture-pane -p -t "$win" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -12)
-  if   grep -Eq 'Esc to cancel|Enter to (select|confirm|submit)|\[[yY]/[nN]\]|Do you want to' <<<"$tail"; then st=ask; na=$((na+1))
-  elif grep -Eq '(esc|ctrl\+c) to interrupt' <<<"$tail"; then st=busy;  nb=$((nb+1))
-  elif grep -E '^❯' <<<"$tail" | tail -1 | grep -Eq '^❯ [^[:space:]]'; then st=draft; nd=$((nd+1))   # input box = last ❯ line
-  elif grep -Eq '^❯|shift\+tab'    <<<"$tail"; then st=idle;  ni=$((ni+1))
-  else st=other; fi
-  [ $counts = 1 ] || printf '%s\t%s\n' "$win" "$st"
-  setcmd+=(set -w -t "$wid" @state "$st" \;)
+  cap+=(display -p -t "$wid" "$(printf '\001')$win	$wid" \; capture-pane -p -t "$wid" \;)
 done < <(tmux list-windows -a -F '#{session_name}:#{window_index}	#{window_id}')
-[ $set_opt = 1 ] && [ ${#setcmd[@]} -gt 0 ] && tmux "${setcmd[@]::${#setcmd[@]}-1}"
-[ $counts = 1 ] && printf '#[fg=white,bg=red] ◐%d #[default] #[fg=black,bg=yellow] ●%d #[default] #[fg=white,bg=magenta] ✎%d #[default] ○%d' "$na" "$nb" "$nd" "$ni"
+[ ${#cap[@]} -gt 0 ] || exit 0
+out=$(tmux "${cap[@]::${#cap[@]}-1}" 2>/dev/null | awk -v set_opt=$set_opt -v counts=$counts '
+  function flush(   i, lo, st, last) {   # classify the last 12 non-blank lines of the current pane
+    if (win == "") return
+    lo = n - 12; if (lo < 0) lo = 0
+    st = "other"; last = ""
+    for (i = lo; i < n; i++) {
+      if (L[i] ~ /Esc to cancel|Enter to (select|confirm|submit)|\[[yY]\/[nN]\]|Do you want to/) { st = "ask"; break }
+      if (L[i] ~ /(esc|ctrl\+c) to interrupt/) st = "busy"
+      if (L[i] ~ /^❯/) last = L[i]
+      if (st == "other" && (L[i] ~ /^❯/ || L[i] ~ /shift\+tab/)) st = "idle"
+    }
+    if (st == "idle" && last ~ /^❯ [^[:space:]]/) st = "draft"   # input box = last ❯ line
+    cnt[st]++
+    if (!counts) printf "%s\t%s\n", win, st
+    if (set_opt) setcmd = setcmd (setcmd == "" ? "" : " ; ") "set -w -t " wid " @state " st
+    win = ""
+  }
+  /^\001/ { flush(); split(substr($0, 2), a, "\t"); win = a[1]; wid = a[2]; n = 0; next }
+  /^[[:space:]]*$/ { next }
+  { L[n++] = $0 }
+  END {
+    flush()
+    if (counts) printf "#[fg=white,bg=red] ◐%d #[default] #[fg=black,bg=yellow] ●%d #[default] #[fg=white,bg=magenta] ✎%d #[default] ○%d\n", cnt["ask"], cnt["busy"], cnt["draft"], cnt["idle"]
+    if (set_opt) print "\002" setcmd
+  }')
+head=${out%%$'\n\002'*}
+printf '%s' "$head"; [ -z "$head" ] || [ $counts = 1 ] || echo
+case $out in *$'\n\002'*) tmux ${out##*$'\n\002'};; esac   # one tmux call; unquoted so each word and each ";" separator is its own argv
 exit 0
